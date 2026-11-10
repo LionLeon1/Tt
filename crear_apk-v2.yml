@@ -1,0 +1,73 @@
+name: Crear APK Android
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: 2. Descomprimir ZIP automaticamente (si subiste el .zip directo)
+        run: |
+          shopt -s nullglob
+          for z in *.zip; do
+            echo "Descomprimiendo $z..."
+            unzip -o "$z" -d .
+          done
+          if [ ! -f "pubspec.yaml" ]; then
+            FOUND_PUBSPEC=$(find . -maxdepth 3 -name "pubspec.yaml" | head -n 1)
+            if [ -n "$FOUND_PUBSPEC" ]; then
+              DIR=$(dirname "$FOUND_PUBSPEC")
+              cp -r "$DIR"/* .
+            fi
+          fi
+          cp pubspec.yaml /tmp/pubspec_backup.yaml
+          cp lib/main.dart /tmp/main_backup.dart
+
+      - name: 3. Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 4. Instalar Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: 5. Generar proyecto base Android y restaurar tu codigo
+        run: |
+          flutter create --platforms=android --org com.saycheese.agent --project-name saycheese_agent .
+          cp /tmp/pubspec_backup.yaml pubspec.yaml
+          mkdir -p lib
+          cp /tmp/main_backup.dart lib/main.dart
+
+      - name: 6. Inyectar permisos en AndroidManifest.xml
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ] && ! grep -q "READ_MEDIA_IMAGES" "$MANIFEST"; then
+            sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET"\/><uses-permission android:name="android.permission.READ_MEDIA_IMAGES"\/><uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"\/><uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"\/><application/' "$MANIFEST"
+          fi
+
+      - name: 7. Instalar librerias y compilar APK
+        env:
+          API_KEY_SECRET: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          flutter pub get
+          if [ -n "$API_KEY_SECRET" ]; then
+            flutter build apk --release --dart-define=GEMINI_API_KEY="$API_KEY_SECRET"
+          else
+            flutter build apk --release
+          fi
+
+      - name: 8. Subir APK listo para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: SayCheese-Agent-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
