@@ -1,0 +1,322 @@
+name: Crear APK Autonomo SayCheese
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. Instalar Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: 4. Crear estructura Android desde cero
+        run: |
+          flutter create --platforms=android --org com.saycheese.agent --project-name saycheese_agent .
+
+      - name: 5. Escribir pubspec.yaml y lib/main.dart automaticamente
+        run: |
+          cat << 'EOF' > pubspec.yaml
+          name: saycheese_agent
+          description: Agente en segundo plano para resolver hojas de ejercicios en la carpeta SayCheese con Gemini 2.5 Pro.
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.2.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            http: ^1.2.0
+            watcher: ^1.1.0
+            permission_handler: ^11.3.0
+            flutter_markdown: ^0.7.1
+            shared_preferences: ^2.2.3
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          EOF
+
+          mkdir -p lib
+          cat << 'EOF' > lib/main.dart
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:watcher/watcher.dart';
+          import 'package:permission_handler/permission_handler.dart';
+          import 'package:flutter_markdown/flutter_markdown.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          void main() {
+            runApp(const SayCheeseAgentApp());
+          }
+
+          class EjercicioResuelto {
+            final String id;
+            final String rutaImagen;
+            final DateTime fecha;
+            String? solucion;
+            bool procesando;
+
+            EjercicioResuelto({
+              required this.id,
+              required this.rutaImagen,
+              required this.fecha,
+              this.solucion,
+              this.procesando = true,
+            });
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'rutaImagen': rutaImagen,
+                  'fecha': fecha.toIso8601String(),
+                  'solucion': solucion,
+                  'procesando': procesando,
+                };
+
+            factory EjercicioResuelto.fromJson(Map<String, dynamic> json) =>
+                EjercicioResuelto(
+                  id: json['id'],
+                  rutaImagen: json['rutaImagen'],
+                  fecha: DateTime.parse(json['fecha']),
+                  solucion: json['solucion'],
+                  procesando: json['procesando'] ?? false,
+                );
+          }
+
+          class SayCheeseAgentApp extends StatelessWidget {
+            const SayCheeseAgentApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'SayCheese Agent',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData.dark(useMaterial3: true).copyWith(
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: Colors.deepPurpleAccent,
+                    brightness: Brightness.dark,
+                  ),
+                ),
+                home: const HomeScreen(),
+              );
+            }
+          }
+
+          class HomeScreen extends StatefulWidget {
+            const HomeScreen({super.key});
+
+            @override
+            State<HomeScreen> createState() => _HomeScreenState();
+          }
+
+          class _HomeScreenState extends State<HomeScreen> {
+            int _pestanaActual = 0;
+            bool _agenteActivo = false;
+            StreamSubscription<WatchEvent>? _watcherSub;
+            final List<EjercicioResuelto> _historial = [];
+
+            final String _rutaCarpeta = '/storage/emulated/0/Pictures/SayCheese';
+            String _apiKey = const String.fromEnvironment('GEMINI_API_KEY', defaultValue: '');
+
+            @override
+            void initState() {
+              super.initState();
+              _cargarDatosLocales();
+              _iniciarAgente();
+            }
+
+            Future<void> _cargarDatosLocales() async {
+              final prefs = await SharedPreferences.getInstance();
+              final savedKey = prefs.getString('gemini_api_key');
+              if (savedKey != null && savedKey.isNotEmpty) {
+                setState(() => _apiKey = savedKey);
+              }
+              final historialJson = prefs.getStringList('historial_ejercicios') ?? [];
+              setState(() {
+                _historial.clear();
+                _historial.addAll(
+                  historialJson.map((e) => EjercicioResuelto.fromJson(jsonDecode(e))),
+                );
+              });
+            }
+
+            Future<void> _guardarHistorialLocal() async {
+              final prefs = await SharedPreferences.getInstance();
+              final listaJson = _historial.map((e) => jsonEncode(e.toJson())).toList();
+              await prefs.setStringList('historial_ejercicios', listaJson);
+            }
+
+            Future<void> _iniciarAgente() async {
+              await [
+                Permission.photos,
+                Permission.storage,
+                Permission.manageExternalStorage,
+              ].request();
+
+              final dir = Directory(_rutaCarpeta);
+              if (!await dir.exists()) {
+                try {
+                  await dir.create(recursive: true);
+                } catch (_) {}
+              }
+
+              final watcher = DirectoryWatcher(_rutaCarpeta);
+              _watcherSub = watcher.events.listen((event) {
+                final pathLower = event.path.toLowerCase();
+                if (event.type == ChangeType.ADD &&
+                    (pathLower.endsWith('.jpg') ||
+                        pathLower.endsWith('.jpeg') ||
+                        pathLower.endsWith('.png'))) {
+                  _procesarNuevaFoto(File(event.path));
+                }
+              });
+
+              setState(() => _agenteActivo = true);
+            }
+
+            Future<void> _procesarNuevaFoto(File archivoImagen) async {
+              await Future.delayed(const Duration(seconds: 2));
+
+              final nuevoItem = EjercicioResuelto(
+                id: DateTime.now().millisecondsSinceEpoch.toString(),
+                rutaImagen: archivoImagen.path,
+                fecha: DateTime.now(),
+              );
+
+              setState(() {
+                _historial.insert(0, nuevoItem);
+              });
+
+              try {
+                final respuesta = await _llamarGeminiProMedio(archivoImagen);
+                setState(() {
+                  nuevoItem.solucion = respuesta;
+                  nuevoItem.procesando = false;
+                });
+                await _guardarHistorialLocal();
+              } catch (e) {
+                setState(() {
+                  nuevoItem.solucion = 'Error al resolver la hoja: $e';
+                  nuevoItem.procesando = false;
+                });
+                await _guardarHistorialLocal();
+              }
+            }
+
+            Future<String> _llamarGeminiProMedio(File imagen) async {
+              if (_apiKey.isEmpty) {
+                throw Exception('Configura tu Gemini API Key en el icono de llave superior.');
+              }
+
+              final url = Uri.parse(
+                'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=$_apiKey',
+              );
+
+              final bytes = await imagen.readAsBytes();
+              final base64Image = base64Encode(bytes);
+
+              final body = jsonEncode({
+                "contents": [
+                  {
+                    "parts": [
+                      {
+                        "text": "Resuelve todos los ejercicios de esta hoja paso a paso. Usa formato Markdown claro, enumera cada ejercicio y destaca el resultado final."
+                      },
+                      {
+                        "inline_data": {
+                          "mime_type": "image/jpeg",
+                          "data": base64Image,
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "generationConfig": {
+                  "thinkingConfig": {
+                    "thinkingBudget": 4096
+                  }
+                }
+              });
+
+              final response = await http.post(
+                url,
+                headers: {'Content-Type': 'application/json'},
+                body: body,
+              );
+
+              if (response.statusCode == 200) {
+                final data = jsonDecode(response.body);
+                final parts = data['candidates'][0]['content']['parts'] as List;
+                final textPart = parts.lastWhere(
+                  (p) => p.containsKey('text') && p['thought'] != true,
+                  orElse: () => parts.last,
+                );
+                return textPart['text'];
+              } else {
+                throw Exception('Codigo ${response.statusCode}:${response.body}');
+              }
+            }
+
+            void _mostrarDialogoApiKey() {
+              final controller = TextEditingController(text: _apiKey);
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Configurar Gemini API Key'),
+                  content: TextField(
+                    controller: controller,
+                    decoration: const InputDecoration(
+                      hintText: 'AIzaSy...',
+                      labelText: 'API Key',
+                    ),
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('Cancelar'),
+                    ),
+                    FilledButton(
+                      onPressed: () async {
+                        final prefs = await SharedPreferences.getInstance();
+                        await prefs.setString('gemini_api_key', controller.text.trim());
+                        setState(() => _apiKey = controller.text.trim());
+                        if (mounted) Navigator.pop(ctx);
+                      },
+                      child: const Text('Guardar'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            @override
+            void dispose() {
+              _watcherSub?.cancel();
+              super.dispose();
+            }
+
+            @override
+            Widget
